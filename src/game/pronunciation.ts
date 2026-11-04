@@ -57,8 +57,8 @@ export function levenshteinDistance(a: string, b: string): number {
 }
 
 /**
- * Generates a simplified phonetic skeleton for non-punitive accent matching
- * (e.g. Brazilian Portuguese speakers pronouncing English words).
+ * Generates a simplified phonetic skeleton for accent-friendly comparison
+ * while preserving distinct word identities (so "potato" never matches "tomato").
  */
 export function phoneticSkeleton(word: string): string {
   return word
@@ -77,10 +77,11 @@ export function phoneticSkeleton(word: string): string {
 
 /**
  * Evaluates a spoken transcript against a target word and optional aliases.
- * Follows a non-punitive tolerance rule:
- * 1. Exact match or substring match on target word or aliases -> 100% match.
- * 2. Individual spoken token within Levenshtein tolerance (<= 1 for short words, <= 2 for >= 5 chars) -> match.
- * 3. Phonetic skeleton match (distance <= 1) -> match.
+ * Rules:
+ * 1. Empty or silent input -> always false.
+ * 2. Exact token match on target word or aliases -> 100% match.
+ * 3. Accent tolerance: token starts with the same initial sound/letter AND
+ *    has Levenshtein distance <= 1 (or <= 2 for words >= 8 chars).
  */
 export function evaluatePronunciation(
   spokenRaw: string,
@@ -97,8 +98,10 @@ export function evaluatePronunciation(
       normalizedSpoken: '',
       normalizedTarget,
       distance: normalizedTarget.length,
-      feedbackEn: 'We did not hear anything. Try speaking closer to the microphone!',
-      feedbackPt: 'Não ouvimos nada. Tente falar mais perto do microfone!',
+      feedbackEn:
+        'No clear voice detected. Speak the word aloud near your microphone!',
+      feedbackPt:
+        'Nenhuma fala clara detectada. Fale a palavra em voz alta perto do microfone!',
     };
   }
 
@@ -107,11 +110,14 @@ export function evaluatePronunciation(
     ...aliases.map((a) => normalizeSpeechText(a)).filter(Boolean),
   ];
 
-  // 1. Direct containment or exact match check
+  const spokenTokens = normalizedSpoken.split(' ').filter(Boolean);
+
+  // 1. Exact phrase or exact word-token match against target or known phonetic aliases
   for (const candidate of candidateTargets) {
     if (
       normalizedSpoken === candidate ||
-      normalizedSpoken.includes(candidate)
+      spokenTokens.includes(candidate) ||
+      (candidate.includes(' ') && normalizedSpoken.includes(candidate))
     ) {
       return {
         isMatch: true,
@@ -119,14 +125,13 @@ export function evaluatePronunciation(
         normalizedSpoken,
         normalizedTarget,
         distance: 0,
-        feedbackEn: `Perfect! "${targetRaw.toUpperCase()}" pronounced clearly!`,
-        feedbackPt: `Perfeito! Você pronunciou "${targetRaw.toUpperCase()}" muito bem!`,
+        feedbackEn: `Perfect! Heard "${spokenRaw.trim()}" — "${targetRaw.toUpperCase()}" pronounced clearly!`,
+        feedbackPt: `Perfeito! Ouvimos "${spokenRaw.trim()}" — pronúncia correta!`,
       };
     }
   }
 
-  // 2. Compare word tokens & full phrase via Levenshtein distance and phonetic skeleton
-  const spokenTokens = normalizedSpoken.split(' ').filter(Boolean);
+  // 2. Compare word tokens & full phrase via strict initial-sound + Levenshtein tolerance
   const comparisonPool = [normalizedSpoken, ...spokenTokens];
 
   let bestDistance = Infinity;
@@ -134,10 +139,12 @@ export function evaluatePronunciation(
   let matchedByTolerance = false;
 
   for (const candidate of candidateTargets) {
-    const maxAllowedDistance = candidate.length >= 5 ? 2 : 1;
+    const maxAllowedDistance = candidate.length >= 8 ? 2 : 1;
     const candidatePhonetic = phoneticSkeleton(candidate);
 
     for (const token of comparisonPool) {
+      if (token.length < 2) continue;
+
       const dist = levenshteinDistance(token, candidate);
       const maxLen = Math.max(token.length, candidate.length, 1);
       const similarity = Math.max(0, Math.round((1 - dist / maxLen) * 100));
@@ -149,14 +156,24 @@ export function evaluatePronunciation(
         bestScore = similarity;
       }
 
-      if (dist <= maxAllowedDistance) {
+      // Require matching initial sound so "potato" != "tomato" and "bread" != "head"
+      const tokenPhonetic = phoneticSkeleton(token);
+      const sameInitial =
+        token[0] === candidate[0] ||
+        tokenPhonetic[0] === candidatePhonetic[0];
+
+      if (sameInitial && dist <= maxAllowedDistance) {
         matchedByTolerance = true;
       }
 
-      // Check phonetic skeleton tolerance for accent friendliness
-      const tokenPhonetic = phoneticSkeleton(token);
+      // Check phonetic skeleton tolerance (only when initial sound matches)
       const phoneticDist = levenshteinDistance(tokenPhonetic, candidatePhonetic);
-      if (phoneticDist <= 1 && candidatePhonetic.length >= 3) {
+      if (
+        sameInitial &&
+        phoneticDist <= 1 &&
+        candidatePhonetic.length >= 4 &&
+        Math.abs(token.length - candidate.length) <= 2
+      ) {
         matchedByTolerance = true;
         bestScore = Math.max(bestScore, 88);
         bestDistance = Math.min(bestDistance, 1);
@@ -167,11 +184,11 @@ export function evaluatePronunciation(
   if (matchedByTolerance) {
     return {
       isMatch: true,
-      score: Math.max(bestScore, 82),
+      score: Math.max(bestScore, 84),
       normalizedSpoken,
       normalizedTarget,
       distance: bestDistance,
-      feedbackEn: `Great job! Heard "${spokenRaw.trim()}" — close enough to ${targetRaw.toUpperCase()}!`,
+      feedbackEn: `Great job! Heard "${spokenRaw.trim()}" — matches ${targetRaw.toUpperCase()}!`,
       feedbackPt: `Muito bom! Ouvimos "${spokenRaw.trim()}" — pronúncia validada!`,
     };
   }
@@ -183,6 +200,6 @@ export function evaluatePronunciation(
     normalizedTarget,
     distance: bestDistance,
     feedbackEn: `Try again! Heard "${spokenRaw.trim()}", expected "${targetRaw.toUpperCase()}".`,
-    feedbackPt: `Tente novamente! Ouvimos "${spokenRaw.trim()}", mas a palavra é "${targetRaw.toUpperCase()}".`,
+    feedbackPt: `Tente novamente! Ouvimos "${spokenRaw.trim()}", mas a palavra correta é "${targetRaw.toUpperCase()}".`,
   };
 }

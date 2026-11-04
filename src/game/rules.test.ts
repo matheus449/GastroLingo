@@ -36,6 +36,9 @@ test('evaluatePronunciation matches exact, phrase-contained, and accent-tolerant
   const wrongWord = evaluatePronunciation('banana', 'TOMATO');
   assert.equal(wrongWord.isMatch, false);
 
+  const rhymingWrongWord = evaluatePronunciation('Potato', 'TOMATO');
+  assert.equal(rhymingWrongWord.isMatch, false);
+
   const emptySpeech = evaluatePronunciation('   ', 'TOMATO');
   assert.equal(emptySpeech.isMatch, false);
 });

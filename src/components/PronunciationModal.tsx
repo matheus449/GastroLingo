@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Mic,
+  Square,
   Volume2,
   X,
   CheckCircle2,
@@ -36,11 +37,6 @@ interface SpeechRecognitionEvent extends Event {
   results: SpeechRecognitionResultList;
 }
 
-interface SpeechRecognitionErrorEvent extends Event {
-  error: string;
-  message?: string;
-}
-
 interface SpeechRecognitionInstance extends EventTarget {
   lang: string;
   continuous: boolean;
@@ -50,7 +46,7 @@ interface SpeechRecognitionInstance extends EventTarget {
   stop(): void;
   abort(): void;
   onresult: ((event: SpeechRecognitionEvent) => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
   onend: (() => void) | null;
 }
 
@@ -72,17 +68,42 @@ interface PronunciationModalProps {
   onClose: () => void;
 }
 
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
-      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
+/**
+ * Downsamples a Float32Array audio buffer from `inputSampleRate` to 16000Hz Int16 PCM
+ * and encodes it as Base64 for fast server-side Whisper transcription.
+ */
+function encodePcm16kBase64(
+  chunks: Float32Array[],
+  inputSampleRate: number
+): string {
+  const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+  const merged = new Float32Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const targetRate = 16000;
+  const ratio = inputSampleRate / targetRate;
+  const outLength = Math.floor(merged.length / ratio);
+  const int16Buffer = new ArrayBuffer(outLength * 2);
+  const view = new DataView(int16Buffer);
+
+  for (let i = 0; i < outLength; i++) {
+    const srcIdx = Math.min(merged.length - 1, Math.floor(i * ratio));
+    const clamped = Math.max(-1, Math.min(1, merged[srcIdx]));
+    const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    view.setInt16(i * 2, int16, true);
+  }
+
+  const bytes = new Uint8Array(int16Buffer);
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return window.btoa(binary);
 }
 
 export const PronunciationModal: React.FC<PronunciationModalProps> = ({
@@ -92,18 +113,21 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
   onClose,
 }) => {
   const [isListening, setIsListening] = useState(false);
-  const [listenProgress, setListenProgress] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [voiceLevel, setVoiceLevel] = useState(0); // 0 to 100 live mic meter
   const [result, setResult] = useState<PronunciationResult | null>(null);
   const [micHint, setMicHint] = useState<string | null>(null);
   const [practiceText, setPracticeText] = useState('');
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const stopCaptureFnRef = useRef<(() => void) | null>(null);
   const autoCloseTimeoutRef = useRef<number | null>(null);
-  const progressTimerRef = useRef<number | null>(null);
-  const watchdogTimerRef = useRef<number | null>(null);
 
-  const cleanupRecording = () => {
+  const cleanupAudioResources = () => {
+    stopCaptureFnRef.current = null;
     if (recognitionRef.current) {
       try {
         recognitionRef.current.abort();
@@ -112,17 +136,25 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
       }
       recognitionRef.current = null;
     }
+    if (processorRef.current) {
+      try {
+        processorRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      processorRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      try {
+        audioCtxRef.current.close();
+      } catch {
+        // ignore
+      }
+      audioCtxRef.current = null;
+    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
-    }
-    if (progressTimerRef.current) {
-      window.clearInterval(progressTimerRef.current);
-      progressTimerRef.current = null;
-    }
-    if (watchdogTimerRef.current) {
-      window.clearTimeout(watchdogTimerRef.current);
-      watchdogTimerRef.current = null;
     }
   };
 
@@ -131,11 +163,12 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
     setMicHint(null);
     setPracticeText('');
     setIsListening(false);
-    setListenProgress(0);
+    setIsTranscribing(false);
+    setVoiceLevel(0);
     soundFX.playPop();
 
     return () => {
-      cleanupRecording();
+      cleanupAudioResources();
       if (autoCloseTimeoutRef.current) {
         window.clearTimeout(autoCloseTimeoutRef.current);
       }
@@ -143,9 +176,10 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
   }, [challenge]);
 
   const handleEvaluation = (spokenText: string) => {
-    cleanupRecording();
+    cleanupAudioResources();
     setIsListening(false);
-    setListenProgress(0);
+    setIsTranscribing(false);
+    setVoiceLevel(0);
     setMicHint(null);
 
     const evalRes = evaluatePronunciation(
@@ -159,7 +193,7 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
       soundFX.playSuccess();
       autoCloseTimeoutRef.current = window.setTimeout(() => {
         onSuccess(challenge, spokenText);
-      }, 750);
+      }, 950);
     } else {
       soundFX.playError();
       onFailure(spokenText);
@@ -167,243 +201,217 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
   };
 
   /**
-   * Tier 3 Fallback: Guided "Speak Along" mode when the browser/iframe has no Web Speech API
-   * or microphone permission is unavailable. Plays native pronunciation,
-   * shows a 1.2s listening progress bar while the player repeats aloud, and validates smoothly.
+   * Real Microphone Capture + Voice Activity Detection (VAD) + Whisper ASR:
+   * - Listens to the user's real microphone via Web Audio API.
+   * - Displays a live voice volume meter while the user speaks.
+   * - Automatically detects when the user starts speaking and finishes speaking
+   *   (or lets the user click the button again to stop).
+   * - If the user stayed silent, rejects with "No voice detected" (never auto-passes!).
+   * - Transcribes the recorded speech via local Whisper ASR (/api/transcribe) or Web Speech API
+   *   and genuinely evaluates the spoken word against the target word.
    */
-  const runGuidedSpeakAlongFallback = () => {
-    cleanupRecording();
-    soundFX.playMicStart();
-    soundFX.speakWord(challenge.targetWord);
-    setIsListening(true);
-    setListenProgress(15);
-    setMicHint(
-      `Listening... Speak "${challenge.targetWord.toUpperCase()}" out loud!`
-    );
+  const toggleMicrophone = async () => {
+    // If already listening, clicking the button stops recording and evaluates immediately
+    if (isListening && stopCaptureFnRef.current) {
+      stopCaptureFnRef.current();
+      return;
+    }
 
-    const startTime = Date.now();
-    const durationMs = 1200;
+    if (isTranscribing) return;
 
-    progressTimerRef.current = window.setInterval(() => {
-      const elapsed = Date.now() - startTime;
-      const pct = Math.min(100, Math.round((elapsed / durationMs) * 100));
-      setListenProgress(pct);
-
-      if (elapsed >= durationMs) {
-        handleEvaluation(challenge.targetWord);
-      }
-    }, 60);
-  };
-
-  /**
-   * Tier 2 Fallback: Universal Microphone Capture via navigator.mediaDevices.getUserMedia
-   * + MediaRecorder + Server-side Gemini Audio Transcription (/api/transcribe).
-   * Includes a 900ms permission timeout so blocked iframes never hang.
-   */
-  const runUniversalAudioRecorder = async () => {
-    cleanupRecording();
+    setResult(null);
+    setMicHint(null);
 
     if (
       typeof navigator === 'undefined' ||
       !navigator.mediaDevices ||
-      !navigator.mediaDevices.getUserMedia ||
-      typeof MediaRecorder === 'undefined'
+      !navigator.mediaDevices.getUserMedia
     ) {
-      runGuidedSpeakAlongFallback();
+      setMicHint(
+        'Seu navegador bloqueou o acesso ao microfone (precisa de HTTPS/permissão). Use o campo abaixo para testar!'
+      );
       return;
     }
 
     try {
-      const streamPromise = navigator.mediaDevices.getUserMedia({ audio: true });
-      const timeoutPromise = new Promise<null>((resolve) =>
-        window.setTimeout(() => resolve(null), 900)
-      );
-      const stream = await Promise.race([streamPromise, timeoutPromise]);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      mediaStreamRef.current = stream;
 
-      if (!stream) {
-        runGuidedSpeakAlongFallback();
-        return;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const audioCtx = new AudioCtx();
+      audioCtxRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      const pcmChunks: Float32Array[] = [];
+      let voicedFrames = 0;
+      let silenceFramesAfterSpeech = 0;
+      let finished = false;
+      let webSpeechTranscript: string | null = null;
+      const startTime = Date.now();
+      const maxRecordingMs = 4500;
+
+      // Also start native SpeechRecognition in parallel if supported by the browser
+      const SpeechRecognitionCtor =
+        (
+          window as unknown as {
+            SpeechRecognition?: new () => SpeechRecognitionInstance;
+          }
+        ).SpeechRecognition ||
+        (
+          window as unknown as {
+            webkitSpeechRecognition?: new () => SpeechRecognitionInstance;
+          }
+        ).webkitSpeechRecognition;
+
+      if (SpeechRecognitionCtor) {
+        try {
+          const rec = new SpeechRecognitionCtor();
+          rec.lang = 'en-US';
+          rec.continuous = false;
+          rec.interimResults = false;
+          rec.maxAlternatives = 5;
+          recognitionRef.current = rec;
+
+          rec.onresult = (event: SpeechRecognitionEvent) => {
+            const first = event.results[0];
+            if (first && first.length > 0) {
+              // Check if any alternative matches
+              for (let i = 0; i < first.length; i++) {
+                const candidate = first[i].transcript;
+                if (
+                  evaluatePronunciation(
+                    candidate,
+                    challenge.targetWord,
+                    challenge.aliases
+                  ).isMatch
+                ) {
+                  webSpeechTranscript = candidate;
+                  break;
+                }
+              }
+              if (!webSpeechTranscript) {
+                webSpeechTranscript = first[0].transcript;
+              }
+              if (!finished) {
+                finishAndEvaluate();
+              }
+            }
+          };
+          rec.start();
+        } catch {
+          // Ignore Web Speech API error; Web Audio PCM + Whisper handles it
+        }
       }
 
-      mediaStreamRef.current = stream;
-      soundFX.playMicStart();
-      setIsListening(true);
-      setListenProgress(10);
-      setMicHint(
-        `Recording microphone... Say "${challenge.targetWord.toUpperCase()}" now!`
-      );
+      const finishAndEvaluate = async () => {
+        if (finished) return;
+        finished = true;
 
-      const chunks: BlobPart[] = [];
-      const recorder = new MediaRecorder(stream);
+        const inputSampleRate = audioCtx.sampleRate;
+        cleanupAudioResources();
+        setIsListening(false);
+        setVoiceLevel(0);
 
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunks.push(e.data);
+        // 1. If Web Speech API already captured a transcript, evaluate it directly
+        if (webSpeechTranscript && webSpeechTranscript.trim().length > 0) {
+          handleEvaluation(webSpeechTranscript);
+          return;
         }
-      };
 
-      const recordDurationMs = 1500;
-      const startTime = Date.now();
-      progressTimerRef.current = window.setInterval(() => {
-        const elapsed = Date.now() - startTime;
-        setListenProgress(
-          Math.min(95, Math.round((elapsed / recordDurationMs) * 100))
-        );
-      }, 60);
+        // 2. Verify that the user actually spoke into the microphone (Voice Activity Detection)
+        if (voicedFrames < 2) {
+          handleEvaluation(''); // Triggers "We did not hear anything. Try speaking closer to the microphone!"
+          return;
+        }
 
-      recorder.onstop = async () => {
-        cleanupRecording();
-        setMicHint('Analyzing your pronunciation...');
+        // 3. Send recorded 16kHz PCM audio to our local Whisper ASR endpoint
+        setIsTranscribing(true);
+        setMicHint('Avaliando sua pronúncia...');
         try {
-          const blob = new Blob(chunks, {
-            type: recorder.mimeType || 'audio/webm',
-          });
-          const audioBase64 = await blobToBase64(blob);
+          const pcmBase64 = encodePcm16kBase64(pcmChunks, inputSampleRate);
           const response = await fetch('/api/transcribe', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              audioBase64,
-              mimeType: blob.type || 'audio/webm',
-              targetWord: challenge.targetWord,
-            }),
+            body: JSON.stringify({ pcmBase64 }),
           });
 
           if (response.ok) {
-            const data = (await response.json()) as {
-              transcript?: string;
-            };
-            handleEvaluation(data.transcript || challenge.targetWord);
+            const data = (await response.json()) as { transcript?: string };
+            handleEvaluation(data.transcript || '');
             return;
           }
         } catch {
-          // Fall through to smooth validation
+          // ignore network error
         }
-        handleEvaluation(challenge.targetWord);
+
+        handleEvaluation('');
       };
 
-      recorder.start();
-      watchdogTimerRef.current = window.setTimeout(() => {
-        if (recorder.state === 'recording') {
-          recorder.stop();
+      stopCaptureFnRef.current = finishAndEvaluate;
+
+      processor.onaudioprocess = (e: AudioProcessingEvent) => {
+        if (finished) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input.length);
+        copy.set(input);
+        pcmChunks.push(copy);
+
+        // Compute RMS voice energy
+        let sumSq = 0;
+        for (let i = 0; i < input.length; i++) {
+          sumSq += input[i] * input[i];
         }
-      }, recordDurationMs);
-    } catch {
-      runGuidedSpeakAlongFallback();
-    }
-  };
+        const rms = Math.sqrt(sumSq / input.length);
+        const levelPct = Math.min(100, Math.round(rms * 420));
+        setVoiceLevel(levelPct);
 
-  /**
-   * Primary Microphone Button Handler:
-   * Tries Native Web Speech API first with a 1.8s responsiveness watchdog ->
-   * falls back automatically to Universal Audio Recorder / Guided Speak-Along so it NEVER fails or hangs.
-   */
-  const startMicrophoneSession = () => {
-    if (isListening) return;
-    setResult(null);
-    setMicHint(null);
-
-    const SpeechRecognitionCtor =
-      (
-        window as unknown as {
-          SpeechRecognition?: new () => SpeechRecognitionInstance;
-        }
-      ).SpeechRecognition ||
-      (
-        window as unknown as {
-          webkitSpeechRecognition?: new () => SpeechRecognitionInstance;
-        }
-      ).webkitSpeechRecognition;
-
-    if (!SpeechRecognitionCtor) {
-      runUniversalAudioRecorder();
-      return;
-    }
-
-    try {
-      cleanupRecording();
-      const recognition = new SpeechRecognitionCtor();
-      recognition.lang = 'en-US';
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.maxAlternatives = 5;
-      recognitionRef.current = recognition;
-
-      let handled = false;
-      const startTime = Date.now();
-      const maxWaitMs = 1800;
-
-      progressTimerRef.current = window.setInterval(() => {
-        const elapsed = Date.now() - startTime;
-        setListenProgress(Math.min(95, Math.round((elapsed / maxWaitMs) * 100)));
-      }, 60);
-
-      // Watchdog: if browser's SpeechRecognition service is unavailable or silent inside an iframe,
-      // complete seamlessly so the user is never stuck
-      watchdogTimerRef.current = window.setTimeout(() => {
-        if (!handled) {
-          handled = true;
-          handleEvaluation(challenge.targetWord);
-        }
-      }, maxWaitMs);
-
-      recognition.onresult = (event: SpeechRecognitionEvent) => {
-        if (handled) return;
-        handled = true;
-
-        const alternatives: string[] = [];
-        const firstResult = event.results[0];
-        if (firstResult) {
-          for (let i = 0; i < firstResult.length; i++) {
-            alternatives.push(firstResult[i].transcript);
-          }
-        }
-
-        let bestEval: PronunciationResult | null = null;
-        let matchedTranscript = alternatives[0] || '';
-
-        for (const alt of alternatives) {
-          const check = evaluatePronunciation(
-            alt,
-            challenge.targetWord,
-            challenge.aliases
+        // Voice Activity Detection (VAD) threshold
+        if (rms > 0.018) {
+          voicedFrames += 1;
+          silenceFramesAfterSpeech = 0;
+          setMicHint(
+            `Ouvindo sua voz... (Clique novamente para finalizar)`
           );
-          if (check.isMatch) {
-            bestEval = check;
-            matchedTranscript = alt;
-            break;
-          }
-          if (!bestEval || check.score > bestEval.score) {
-            bestEval = check;
-            matchedTranscript = alt;
+        } else if (voicedFrames >= 3) {
+          silenceFramesAfterSpeech += 1;
+          // ~0.75 seconds of silence after speaking a word -> auto-stop and evaluate!
+          if (silenceFramesAfterSpeech >= 8) {
+            finishAndEvaluate();
+            return;
           }
         }
 
-        handleEvaluation(matchedTranscript || challenge.targetWord);
-      };
-
-      recognition.onerror = () => {
-        if (handled) return;
-        handled = true;
-        runGuidedSpeakAlongFallback();
-      };
-
-      recognition.onend = () => {
-        if (!handled) {
-          handled = true;
-          handleEvaluation(challenge.targetWord);
+        if (Date.now() - startTime >= maxRecordingMs) {
+          finishAndEvaluate();
         }
       };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
 
       soundFX.playMicStart();
       setIsListening(true);
-      setListenProgress(10);
       setMicHint(
-        `Listening... Say "${challenge.targetWord.toUpperCase()}" in English!`
+        `Fale "${challenge.targetWord.toUpperCase()}" no microfone agora!`
       );
-      recognition.start();
     } catch {
-      runGuidedSpeakAlongFallback();
+      cleanupAudioResources();
+      setIsListening(false);
+      setMicHint(
+        'Permissão do microfone negada pelo navegador. Permita o uso do microfone no ícone de cadeado da barra de endereços!'
+      );
     }
   };
 
@@ -481,30 +489,42 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
         <div className="mt-6 flex flex-col items-center">
           <button
             type="button"
-            onClick={startMicrophoneSession}
+            onClick={toggleMicrophone}
+            disabled={isTranscribing}
             aria-label={`Speak ${challenge.targetWord} into microphone`}
             className={`group relative flex h-24 w-24 items-center justify-center rounded-full border-2 transition-transform active:scale-95 ${
               isListening
-                ? 'border-emerald-400 bg-emerald-500/25 text-emerald-200 scale-105'
+                ? 'border-rose-400 bg-rose-500/25 text-rose-200 scale-105'
+                : isTranscribing
+                ? 'border-sky-400 bg-sky-500/20 text-sky-200'
                 : 'border-amber-400/80 bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 hover:scale-105'
             }`}
           >
-            <Mic className="h-10 w-10" />
+            {isListening ? (
+              <Square className="h-8 w-8 fill-current" />
+            ) : (
+              <Mic className="h-10 w-10" />
+            )}
           </button>
 
-          <span className="mt-3 text-xs font-semibold text-zinc-200">
-            {isListening
-              ? micHint || 'Listening... Speak now in English!'
+          <span className="mt-3 text-center text-xs font-semibold text-zinc-200">
+            {micHint
+              ? micHint
+              : isListening
+              ? `Fale "${challenge.targetWord.toUpperCase()}" agora (ou clique para parar)`
               : 'Click the Microphone & Speak in English'}
           </span>
 
-          {/* Live Recording Progress Bar */}
-          {isListening && listenProgress > 0 && (
-            <div className="mt-2.5 h-1.5 w-48 overflow-hidden rounded-full bg-white/10">
-              <div
-                className="h-full rounded-full bg-emerald-400 transition-all duration-75"
-                style={{ width: `${listenProgress}%` }}
-              />
+          {/* Live Voice Volume Meter */}
+          {isListening && (
+            <div className="mt-2.5 flex items-center gap-2 w-52">
+              <span className="text-[10px] font-mono text-zinc-400">VOL</span>
+              <div className="h-2 flex-1 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-emerald-400 transition-all duration-75"
+                  style={{ width: `${Math.max(6, voiceLevel)}%` }}
+                />
+              </div>
             </div>
           )}
         </div>
@@ -537,7 +557,7 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
                   type="button"
                   onClick={() => {
                     setResult(null);
-                    startMicrophoneSession();
+                    toggleMicrophone();
                   }}
                   className="inline-flex items-center gap-1 rounded-lg bg-rose-500/30 border border-rose-400/40 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-rose-500/40 whitespace-nowrap shrink-0"
                 >
@@ -552,7 +572,7 @@ export const PronunciationModal: React.FC<PronunciationModalProps> = ({
         {/* Quick 1-Click Voice Simulator & Text Practice */}
         <div className="mt-6 border-t border-white/10 pt-4">
           <div className="flex items-center justify-between text-xs text-zinc-400 mb-2">
-            <span>Quick practice options:</span>
+            <span>Manual test (without mic):</span>
             <div className="flex items-center gap-1.5">
               <button
                 type="button"

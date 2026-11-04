@@ -83,7 +83,7 @@ export const INGREDIENTS: Record<string, IngredientDef> = {
     color: 0xc88a4b,
     accentHex: '#d97706',
     position: { x: 4.2, z: -5.4 },
-    acceptedAliases: ['bread', 'bred', 'brad', 'red'],
+    acceptedAliases: ['bread', 'bred', 'brred'],
     hintPt: 'Diga "BRÉD"',
   },
   LETTUCE: {
@@ -95,7 +95,7 @@ export const INGREDIENTS: Record<string, IngredientDef> = {
     color: 0x6ab04c,
     accentHex: '#22c55e',
     position: { x: 6.4, z: -3.2 },
-    acceptedAliases: ['lettuce', 'letus', 'lettis', 'let us', 'lattice'],
+    acceptedAliases: ['lettuce', 'letus', 'lettis', 'letis'],
     hintPt: 'Diga "LÉ-tis"',
   },
   APPLE: {
@@ -119,7 +119,7 @@ export const INGREDIENTS: Record<string, IngredientDef> = {
     color: 0xffeaa7,
     accentHex: '#fde047',
     position: { x: 6.4, z: 2.0 },
-    acceptedAliases: ['butter', 'buter', 'batter', 'budder'],
+    acceptedAliases: ['butter', 'buter', 'budder'],
     hintPt: 'Diga "BÂ-târ"',
   },
   MUSHROOM: {
@@ -150,7 +150,7 @@ export const RECIPES: RecipeDef[] = [
     rewardCoins: 45,
     rewardXp: 50,
     dishColor: 0xe64833,
-    acceptedAliases: ['tomato soup', 'soup', 'tomato'],
+    acceptedAliases: ['tomato soup', 'tomatosoup', 'tomato sup'],
   },
   {
     id: 'cheese_burger',
@@ -163,7 +163,7 @@ export const RECIPES: RecipeDef[] = [
     rewardCoins: 55,
     rewardXp: 60,
     dishColor: 0xf4b41a,
-    acceptedAliases: ['cheese burger', 'cheeseburger', 'burger'],
+    acceptedAliases: ['cheese burger', 'cheeseburger', 'cheeze burger'],
   },
   {
     id: 'apple_pie',
@@ -176,7 +176,7 @@ export const RECIPES: RecipeDef[] = [
     rewardCoins: 65,
     rewardXp: 70,
     dishColor: 0xe17055,
-    acceptedAliases: ['apple pie', 'pie', 'apple'],
+    acceptedAliases: ['apple pie', 'applepie', 'apol pie'],
   },
   {
     id: 'mushroom_toast',
@@ -189,7 +189,7 @@ export const RECIPES: RecipeDef[] = [
     rewardCoins: 60,
     rewardXp: 65,
     dishColor: 0xa67c52,
-    acceptedAliases: ['mushroom toast', 'toast', 'mushroom'],
+    acceptedAliases: ['mushroom toast', 'mushroomtoast', 'mashroom toast'],
   },
 ];
 
