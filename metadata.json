@@ -1,0 +1,6 @@
+{
+  "name": "English Kitchen",
+  "description": "An isometric 3D low-poly culinary game where you play as a Chef, collect ingredients, and cook dishes by pronouncing English words aloud.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
